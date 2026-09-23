@@ -1,8 +1,3 @@
-from fastapi import FastAPI
+from privacy_gateway.app import app  # noqa: F401
 
-app = FastAPI()
-
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+__all__ = ["app"]
