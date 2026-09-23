@@ -1,8 +1,6 @@
-from fastapi import FastAPI
+from privacy_gateway.api import create_app
+from privacy_gateway.clock import SystemClock
+from privacy_gateway.seed import build_service
 
-app = FastAPI()
-
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+service = build_service(SystemClock())
+app = create_app(service)
