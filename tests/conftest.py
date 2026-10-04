@@ -29,12 +29,18 @@ def engine_env():
 
 @pytest.fixture(autouse=True)
 def decision_trace():
-    logger = logging.getLogger("privacy_gateway.decider")
+    loggers = [
+        logging.getLogger("privacy_gateway.decider"),
+        logging.getLogger("privacy_gateway.holds"),
+    ]
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(logging.Formatter("[trace] %(message)s"))
-    logger.addHandler(handler)
-    old_level = logger.level
-    logger.setLevel(logging.INFO)
+    old_levels = []
+    for logger in loggers:
+        logger.addHandler(handler)
+        old_levels.append(logger.level)
+        logger.setLevel(logging.INFO)
     yield
-    logger.removeHandler(handler)
-    logger.setLevel(old_level)
+    for logger, old in zip(loggers, old_levels):
+        logger.removeHandler(handler)
+        logger.setLevel(old)

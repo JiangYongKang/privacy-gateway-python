@@ -80,3 +80,24 @@ class IdempotencyConflictError(PrivacyError):
 
     code = "IDEMPOTENCY_CONFLICT"
     http_status = 409
+
+
+class HoldNotFoundError(PrivacyError):
+    """The referenced retention hold does not exist."""
+
+    code = "HOLD_NOT_FOUND"
+    http_status = 404
+
+
+class HoldConflictError(PrivacyError):
+    """A hold id is being reused with a different payload."""
+
+    code = "HOLD_CONFLICT"
+    http_status = 409
+
+
+class AuditNotFoundError(PrivacyError):
+    """No audit entry exists for the referenced request id."""
+
+    code = "AUDIT_NOT_FOUND"
+    http_status = 404

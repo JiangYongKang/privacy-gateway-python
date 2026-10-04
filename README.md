@@ -12,13 +12,16 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `privacy_gateway/models.py` | 策略、调用方、资源、决策、审计条目的不可变数据模型 |
+| `privacy_gateway/models.py` | 策略、调用方、资源、决策、审计条目、保留期延长记录的不可变数据模型 |
 | `privacy_gateway/errors.py` | 带稳定 `code` 的拒绝异常，拒绝原因彼此可区分 |
 | `privacy_gateway/policies.py` | 策略版本解析、策略校验与冲突检测（默认拒绝） |
 | `privacy_gateway/masking.py` | 确定性脱敏原语：visible/redact/mask/hash |
-| `privacy_gateway/store.py` | 本地存储；策略版本不可变，仅“当前版本”指针可移动 |
-| `privacy_gateway/audit.py` | 追加式、幂等、加锁全序的审计日志 |
-| `privacy_gateway/decider.py` | 决策引擎：认证→授权→保留期→脱敏→审计 |
+| `privacy_gateway/store.py` | 本地存储；策略版本不可变，仅“当前版本”指针可移动；保留期延长记录 |
+| `privacy_gateway/audit.py` | 追加式、幂等、加锁全序的审计日志（访问决策 + 生命周期事件） |
+| `privacy_gateway/decider.py` | 决策引擎：认证→授权→保留期（含延长）→脱敏→审计 |
+| `privacy_gateway/holds.py` | 保留期延长 / 解除（法务保留），动作本身可审计、可回放 |
+| `privacy_gateway/forensics.py` | 决策取证导出（字节确定）与离线校验（CONSISTENT / INCONSISTENT） |
+| `privacy_gateway/export.py` | 审计增量 / 分批导出：游标分页、断点续传、内存有界 |
 | `privacy_gateway/replay.py` | 基于审计快照回放历史结论（不重新判定） |
 | `privacy_gateway/fixtures.py` | 确定性种子数据（调用方/资源/两个策略版本） |
 | `privacy_gateway/clock.py` | 可注入时钟（`SystemClock` / `FixedClock`） |
@@ -73,7 +76,7 @@ Policy(version, scope_policies, default_retention_days, created_at)
 | 5 | scope 是否被策略覆盖 | `SCOPE_NOT_POLICIED` 403（策略缺省） |
 | 6 | scope 授权（allow list） | `ACCESS_DENIED` 403 |
 | 7 | 字段级授权（字段越权） | `FIELD_FORBIDDEN` 403 |
-| 8 | 保留期检查 | `RETENTION_EXPIRED` 410 或墓碑（200, `decision=tombstone`） |
+| 8 | 保留期检查（含延长） | `RETENTION_EXPIRED` 410 或墓碑（200, `decision=tombstone`）；挂有有效延长时放行 |
 | 9 | 确定性脱敏 | — |
 | 10 | 追加审计（每 request_id 仅一条） | — |
 
@@ -86,8 +89,12 @@ Policy(version, scope_policies, default_retention_days, created_at)
 - **幂等**：相同 `request_id` + 相同安全载荷指纹（SHA-256，内容仅含身份/资源/版本/字段列表）
   的重复提交或重试直接返回原条目，**不会产生重复审计**；同 id 不同载荷 → 409 且不改变状态。
 - **只存安全材料**：决策、拒绝码、脱敏后字段快照、策略版本、依据描述与时间戳。
+- **事件类型可区分**：每条审计带 `event_type`（`access` / `hold_place` / `hold_release`），
+  访问决策另固化判定当时的 `retention_state`（是否超期、是否因延长放行），
+  保证首次判定、重试与回放对“当时超没超期”的回答一致。
 - 单测日志中每次判定都会打印：输入（caller/resource/请求版本/字段）、命中的策略版本、
-  判定依据（如 `access-denied`、`retention-expired`）以及命中的字段规则。
+  判定依据（如 `access-denied`、`retention-expired`、`retention-hold-active`、
+  `hold-place`）以及命中的字段规则。
   用 `uv run pytest -s` 可查看 `[trace]` 行。
 
 ## 6. 保留期语义
@@ -102,7 +109,52 @@ Policy(version, scope_policies, default_retention_days, created_at)
   允许，v2 的 90 天窗口外为墓碑）。**策略升级不影响历史结论**：回放始终渲染存储的快照，
   不重新访问现行策略或数据。
 
-## 7. HTTP 接口
+## 7. 保留期延长 / 解除（法务保留）
+
+运营可以对**某个具体资源**挂一条保留期延长（`RetentionHold`），效果与语义：
+
+- **挂上（place）**：资源即使已超过普通保留期，读取也照常放行，**脱敏规则完全不变**；
+  授权、字段治理等其他判定一概不受影响（延长只暂停保留期这一阶段，不会放大权限）。
+  该结论的 `retention_state` 记为 `past_retention_hold_active`，`expired=true`，
+  日志依据为 `retention-hold-active`，与普通读取（`decision`）、越权（`access-denied`）、
+  超期（`retention-expired`）明确区分。
+- **解除（release）**：立即恢复普通保留期处理，下一次读取重新按超期拒绝/墓碑。
+- **动作本身可审计、可回放**：挂上与解除都会写入审计流，`event_type` 分别为
+  `hold_place` / `hold_release`（区别于访问决策的 `access`），携带 hold_id、资源、
+  操作人与时间，不含任何字段内容；回放接口同样能渲染这两条事件。
+- **幂等**：同一 `hold_id` 相同载荷重复挂 → 返回原记录、不新增审计；不同载荷 →
+  `HOLD_CONFLICT` 409。重复解除 → 返回原解除记录，不新增审计。
+- **结论一致性**：是否挂有延长直接决定“当时算不算超期”。每条决策都把当时的
+  `retention_state`（`within_retention` / `past_retention` /
+  `past_retention_hold_active`）固化进审计快照，因此同一请求无论是第一次判定、
+  解除后重试，还是事后回放，结论与“当时超没超期”的状态都完全一致。
+
+## 8. 决策取证导出与离线校验
+
+- **导出**：`GET /v1/forensics/{request_id}` 把一条已产生的历史结论渲染为机器可读的
+  取证文档（规范 JSON：键排序、紧凑分隔符、纯 ASCII），内容为审计条目快照
+  （决策、deny_code、`retention_state`、脱敏后字段快照、时间戳）+ 条目规范编码的
+  SHA-256 校验和。**不含任何原始敏感值**。
+- **字节确定**：同一历史结论在任何时间、任何进程重复导出，结果逐字节一致，
+  可直接按字节核对。
+- **校验**：`POST /v1/forensics/verify`（或 `verify_evidence(blob, audit)`）做两层核对——
+  文档自完整性（校验和）+ 与权威审计流中的历史结论逐字段比对。任何篡改或漂移
+  （包括“当时是否超期”“按哪种方式处理”对不上）都返回明确的
+  `{"status": "INCONSISTENT", "mismatches": [...]}`，绝不静默放过；校验结论同样只含
+  安全字段。 malformed 输入不会抛异常，一律判 INCONSISTENT。
+- **兼容范围**：文档携带 `schema = privacy-gateway/evidence@1`，校验只接受该版本；
+  其他版本一律 INCONSISTENT。校验需要能访问同一审计流（权威来源）。
+
+## 9. 审计增量 / 分批导出
+
+- `GET /v1/audit-export?cursor=&limit=` 按游标分页；`stream_entries()` 提供生成器式
+  流式导出，任何时刻只持有一页，**内存有界**，大导出不会把全部历史读进内存。
+- 游标基于**连续无空洞的审计序号**（格式 `pg1:<sequence>`，指向上次最后一条之后）：
+  导出过程中有新访问并发写入时，已导出的条目不会重复、未导出的不会遗漏，顺序稳定。
+- **断点续传 / 幂等**：同一游标重复请求返回同一页；从任意游标继续即可接着导。
+- `limit` 被钳制在 `[1, 1000]`；非法游标返回 `INVALID_CURSOR` 400。
+
+## 10. HTTP 接口
 
 | 方法与路径 | 说明 |
 | --- | --- |
@@ -113,6 +165,12 @@ Policy(version, scope_policies, default_retention_days, created_at)
 | `GET /v1/replay` | 回放全部历史决策（与当时一致的响应形态） |
 | `GET /v1/policies` | 列出已存版本与当前版本 |
 | `POST /v1/policies/{version}/activate` | 切换当前策略版本 |
+| `POST /v1/holds` | 挂保留期延长（body：`hold_id`/`resource_id`/`placed_by`/`reason`） |
+| `POST /v1/holds/{hold_id}/release` | 解除保留期延长（body：`released_by`） |
+| `GET /v1/holds/{hold_id}` | 查看延长记录（含是否仍有效） |
+| `GET /v1/audit-export?cursor=&limit=` | 增量 / 分批导出审计（游标分页） |
+| `GET /v1/forensics/{request_id}` | 导出该结论的取证文档（字节确定） |
+| `POST /v1/forensics/verify` | 校验取证文档（body：`{"evidence": {...}}`） |
 
 决策请求体：
 
@@ -129,12 +187,12 @@ Policy(version, scope_policies, default_retention_days, created_at)
 `policy_version` 省略时使用当前版本；`fields` 省略时按资源全部字段走一遍字段授权
 （未治理字段将导致 `FIELD_FORBIDDEN`）。
 
-## 8. 本地验证
+## 11. 本地验证
 
 ```bash
 uv sync                                  # 安装依赖（含 pytest 开发依赖）
 uv run pytest -v -s                      # 全量测试 + 打印判定 trace
-uv run pytest -q                         # 安静模式（当前 21 个用例全部通过）
+uv run pytest -q                         # 安静模式（当前 44 个用例全部通过）
 uv run fastapi dev main.py               # 启动服务：http://127.0.0.1:8000/docs
 ```
 
@@ -158,9 +216,23 @@ curl -s -X POST localhost:8000/v1/access/decide -H 'content-type: application/js
   -d '{"request_id":"q3","caller_id":"alice","resource_id":"r-patient-1","policy_version":"policy-vX"}'
 
 curl -s localhost:8000/v1/replay         # 回放：历史结论不受当前版本影响
+
+# 保留期延长：r-patient-old 已超期，挂延长后可读（脱敏照旧），解除后回到超期拒绝
+curl -s -X POST localhost:8000/v1/holds -H 'content-type: application/json' \
+  -d '{"hold_id":"h-1","resource_id":"r-patient-old","placed_by":"ops","reason":"legal case"}'
+curl -s -X POST localhost:8000/v1/access/decide -H 'content-type: application/json' \
+  -d '{"request_id":"q4","caller_id":"alice","resource_id":"r-patient-old"}'
+curl -s -X POST localhost:8000/v1/holds/h-1/release -H 'content-type: application/json' \
+  -d '{"released_by":"ops"}'
+
+# 取证导出 + 校验；审计增量导出
+curl -s localhost:8000/v1/forensics/q4
+curl -s -X POST localhost:8000/v1/forensics/verify -H 'content-type: application/json' \
+  -d "{\"evidence\": $(curl -s localhost:8000/v1/forensics/q4)}"
+curl -s 'localhost:8000/v1/audit-export?limit=2'
 ```
 
-## 9. 测试覆盖一览
+## 12. 测试覆盖一览
 
 - `tests/test_access_and_masking.py`：六类拒绝原因可区分、脱敏确定性与版本差异、
   原始值不出现在日志中（caplog 校验输入/版本/依据三要素）。
@@ -169,3 +241,11 @@ curl -s localhost:8000/v1/replay         # 回放：历史结论不受当前版�
 - `tests/test_policy_version_retention.py`：版本升级不改历史结论、超期拒绝不返内容、
   跨版本保留阈值差异、purge 擦除后可审计、版本不存在拒绝、策略冲突拒绝、版本不可变。
 - `tests/test_masking_primitives.py`：mask/hash 纯函数确定性与回放顺序/内容稳定。
+- `tests/test_retention_holds.py`：延长期间超期资源可读且脱敏照旧、解除后立即回到
+  保留期处理、挂上/解除可审计可回放且依据可区分、重试与回放结论（含当时是否超期）
+  完全一致、挂/解除幂等与冲突、延长不放大权限。
+- `tests/test_forensics.py`：取证文档重复导出逐字节一致、三种处理方式（allow / deny /
+  延长放行）校验一致、篡改与伪造一律 INCONSISTENT、malformed 输入不抛异常、
+  导出与校验结论不含原始敏感值。
+- `tests/test_audit_export.py`：分页全集有序无空洞、游标复用同页、断点续传、
+  limit 边界与钳制、流式导出内存有界、并发写入下导出不漏不重、HTTP 端点与非法游标。

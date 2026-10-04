@@ -99,6 +99,65 @@ class Decision(str, Enum):
     TOMBSTONE = "tombstone"  # retention horizon passed: only a stub is emitted
 
 
+class RetentionState(str, Enum):
+    """Whether the resource was past its retention horizon *at decision time*.
+
+    Recorded on every decision/audit entry so first evaluation, idempotent
+    retry and later replay all report the same historical state.
+    """
+
+    WITHIN = "within_retention"
+    EXPIRED = "past_retention"
+    EXPIRED_HOLD = "past_retention_hold_active"  # past horizon, readable via hold
+
+
+class AuditEventType(str, Enum):
+    """Distinguishes what kind of action an audit entry records."""
+
+    ACCESS = "access"                  # a read decision (allow/deny/tombstone)
+    HOLD_PLACE = "hold_place"          # a retention extension was attached
+    HOLD_RELEASE = "hold_release"      # a retention extension was lifted
+
+
+# ---------------------------------------------------------------------------
+# Retention holds (legal-hold style retention extension)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class RetentionHold:
+    """A retention extension attached to one specific resource.
+
+    While ``released_at`` is None the hold is active: reads of a resource past
+    its ordinary retention horizon proceed (with masking as usual). Releasing
+    the hold immediately restores ordinary retention handling. The record
+    itself is immutable; a release produces a new record value in the store.
+    """
+
+    hold_id: str
+    resource_id: str
+    placed_by: str
+    reason: str
+    placed_at: str
+    released_at: str | None = None
+    released_by: str | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.released_at is None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "hold_id": self.hold_id,
+            "resource_id": self.resource_id,
+            "placed_by": self.placed_by,
+            "reason": self.reason,
+            "placed_at": self.placed_at,
+            "released_at": self.released_at,
+            "released_by": self.released_by,
+            "active": self.active,
+        }
+
+
 @dataclass(frozen=True)
 class AccessRequest:
     """A single read attempt. ``request_id`` drives audit idempotency."""
@@ -129,7 +188,8 @@ class DecisionResult:
     fields: dict[str, FieldOutcome] = field(default_factory=dict)
     reason: str = ""                     # human-readable, safe text only
     decided_at: str = ""
-    expired: bool = False                # True when a retention tombstone
+    expired: bool = False                # True when past the retention horizon
+    retention_state: str = RetentionState.WITHIN.value
 
     def to_response(self) -> dict[str, Any]:
         return {
@@ -142,6 +202,7 @@ class DecisionResult:
             "reason": self.reason,
             "decided_at": self.decided_at,
             "expired": self.expired,
+            "retention_state": self.retention_state,
             "fields": {
                 name: {"action": fo.action.value, "value": fo.value}
                 for name, fo in sorted(self.fields.items())
@@ -169,6 +230,9 @@ class AuditEntry:
     fields_snapshot: dict[str, Any]
     request_fingerprint: str
     decided_at: str
+    event_type: str = AuditEventType.ACCESS.value
+    retention_state: str = RetentionState.WITHIN.value
+    hold_id: str = ""                    # set on hold_place / hold_release events
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -184,6 +248,9 @@ class AuditEntry:
             "fields_snapshot": self.fields_snapshot,
             "request_fingerprint": self.request_fingerprint,
             "decided_at": self.decided_at,
+            "event_type": self.event_type,
+            "retention_state": self.retention_state,
+            "hold_id": self.hold_id,
         }
 
 

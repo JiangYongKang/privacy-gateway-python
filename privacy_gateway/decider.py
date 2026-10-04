@@ -44,6 +44,7 @@ from .models import (
     FieldOutcome,
     FieldRule,
     MaskAction,
+    RetentionState,
 )
 from .policies import load_policy, validate_policy
 from .store import LocalStore
@@ -54,6 +55,7 @@ logger = logging.getLogger("privacy_gateway.decider")
 def _replay_result(entry: AuditEntry) -> DecisionResult:
     """Rebuild the exact DecisionResult that was originally stored."""
 
+    expired = entry.retention_state != RetentionState.WITHIN.value
     return DecisionResult(
         request_id=entry.request_id,
         decision=entry.decision,
@@ -71,7 +73,8 @@ def _replay_result(entry: AuditEntry) -> DecisionResult:
         },
         reason=entry.reason,
         decided_at=entry.decided_at,
-        expired=entry.decision is Decision.TOMBSTONE,
+        expired=expired,
+        retention_state=entry.retention_state,
     )
 
 
@@ -165,11 +168,16 @@ class Decider:
             retention_days is not None
             and age > timedelta(days=retention_days)
         )
-        if expired:
+        hold = self.store.active_hold_for(req.resource_id) if expired else None
+        if expired and hold is None:
             return self._handle_expired(
                 req, version, resource.scope, requested, scope_policy.on_expiry.value,
                 retention_days,
             )
+        retention_state = (
+            RetentionState.EXPIRED_HOLD.value if expired
+            else RetentionState.WITHIN.value
+        )
 
         # Stage 9: deterministic masking ----------------------------------
         outcomes: dict[str, FieldOutcome] = {}
@@ -183,6 +191,20 @@ class Decider:
             )
             rule_hits.append(f"{name}={mask_for_log(rule)}")
 
+        if hold is not None:
+            basis = "retention-hold-active"
+            reason = (
+                f"allow: caller on allow list for scope {resource.scope!r}; "
+                f"resource past retention horizon ({retention_days}d) but "
+                f"retention hold {hold.hold_id!r} is active; "
+                f"fields [{', '.join(rule_hits)}]; policy {version!r}"
+            )
+        else:
+            basis = "decision"
+            reason = (
+                f"allow: caller on allow list for scope {resource.scope!r}; "
+                f"fields [{', '.join(rule_hits)}]; policy {version!r}"
+            )
         result = DecisionResult(
             request_id=req.request_id,
             decision=Decision.ALLOW,
@@ -191,16 +213,15 @@ class Decider:
             resource_id=req.resource_id,
             scope=resource.scope,
             fields=outcomes,
-            reason=(
-                f"allow: caller on allow list for scope {resource.scope!r}; "
-                f"fields [{', '.join(rule_hits)}]; policy {version!r}"
-            ),
+            reason=reason,
             decided_at=self.clock.now_iso(),
+            expired=expired,
+            retention_state=retention_state,
         )
 
         # Stage 10: audit --------------------------------------------------
         self.audit.append(result, "", fingerprint, result.decided_at)
-        self._log_event(req, "allow", "decision", version=version,
+        self._log_event(req, "allow", basis, version=version,
                         scope=resource.scope, rule_hits=rule_hits)
         return result
 
@@ -231,6 +252,7 @@ class Decider:
                 ),
                 decided_at=self.clock.now_iso(),
                 expired=True,
+                retention_state=RetentionState.EXPIRED.value,
             )
             self.audit.append(result, "", self._fingerprint(req), result.decided_at)
             self._log_event(req, "tombstone", "retention-expired",
@@ -253,6 +275,7 @@ class Decider:
             ),
             decided_at=self.clock.now_iso(),
             expired=True,
+            retention_state=RetentionState.EXPIRED.value,
         )
         self.audit.append(result, "RETENTION_EXPIRED", self._fingerprint(req),
                           result.decided_at)

@@ -10,7 +10,7 @@ from __future__ import annotations
 from threading import RLock
 
 from .errors import PolicyNotFoundError
-from .models import Caller, Policy, Resource
+from .models import Caller, Policy, Resource, RetentionHold
 
 
 class LocalStore:
@@ -19,6 +19,7 @@ class LocalStore:
         self._resources: dict[str, Resource] = {}
         self._policies: dict[str, Policy] = {}
         self._current_policy_version: str | None = None
+        self._holds: dict[str, RetentionHold] = {}
         self._lock = RLock()
 
     # callers -------------------------------------------------------------
@@ -80,3 +81,36 @@ class LocalStore:
                     f"cannot make {version!r} current: version does not exist"
                 )
             self._current_policy_version = version
+
+    # retention holds -----------------------------------------------------
+    def add_hold(self, hold: RetentionHold) -> None:
+        """Store a hold record. Hold ids are unique; re-adding the identical
+        record is a no-op so placement stays idempotent."""
+
+        with self._lock:
+            existing = self._holds.get(hold.hold_id)
+            if existing is not None and existing != hold:
+                from .errors import HoldConflictError
+
+                raise HoldConflictError(
+                    f"hold {hold.hold_id!r} already exists with a different "
+                    "payload; hold ids are immutable"
+                )
+            self._holds[hold.hold_id] = hold
+
+    def get_hold(self, hold_id: str) -> RetentionHold | None:
+        with self._lock:
+            return self._holds.get(hold_id)
+
+    def replace_hold(self, hold: RetentionHold) -> None:
+        """Atomically replace a hold record (used for release)."""
+
+        with self._lock:
+            self._holds[hold.hold_id] = hold
+
+    def active_hold_for(self, resource_id: str) -> RetentionHold | None:
+        with self._lock:
+            for hold in self._holds.values():
+                if hold.resource_id == resource_id and hold.active:
+                    return hold
+            return None

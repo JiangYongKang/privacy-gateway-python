@@ -7,10 +7,11 @@ rejection reasons stay distinguishable over HTTP.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -18,7 +19,10 @@ from .audit import AuditLog
 from .clock import Clock, SystemClock
 from .decider import Decider
 from .errors import PrivacyError
+from .export import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, export_page
 from .fixtures import build_seed_store
+from .forensics import export_evidence, verify_evidence
+from .holds import HoldManager
 from .models import AccessRequest, Decision
 from .replay import replay_all
 from .store import LocalStore
@@ -30,6 +34,21 @@ class DecideBody(BaseModel):
     resource_id: str
     policy_version: str | None = None
     fields: list[str] | None = None
+
+
+class HoldBody(BaseModel):
+    hold_id: str
+    resource_id: str
+    placed_by: str
+    reason: str = ""
+
+
+class ReleaseBody(BaseModel):
+    released_by: str
+
+
+class VerifyBody(BaseModel):
+    evidence: dict
 
 
 def _error_classes_by_code() -> dict[str, type[PrivacyError]]:
@@ -50,6 +69,7 @@ def create_app(
     audit = audit or AuditLog()
     clock = clock or SystemClock()
     engine = Decider(store, audit, clock)
+    holds = HoldManager(store, audit, clock)
     error_registry = _error_classes_by_code()
 
     app = FastAPI(title="privacy-gateway", version="0.1.0")
@@ -119,6 +139,54 @@ def create_app(
     def activate(version: str) -> dict[str, str]:
         store.set_current_policy_version(version)
         return {"current": store.current_policy_version()}
+
+    # -- retention holds --------------------------------------------------
+    @app.post("/v1/holds")
+    def place_hold(body: HoldBody) -> dict[str, Any]:
+        hold = holds.place_hold(
+            body.hold_id, body.resource_id, body.placed_by, body.reason,
+        )
+        return hold.to_dict()
+
+    @app.post("/v1/holds/{hold_id}/release")
+    def release_hold(hold_id: str, body: ReleaseBody) -> dict[str, Any]:
+        return holds.release_hold(hold_id, body.released_by).to_dict()
+
+    @app.get("/v1/holds/{hold_id}")
+    def get_hold(hold_id: str) -> dict[str, Any]:
+        hold = store.get_hold(hold_id)
+        if hold is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": {"code": "HOLD_NOT_FOUND",
+                                   "message": f"no hold {hold_id!r}"}},
+            )
+        return hold.to_dict()
+
+    # -- incremental audit export -----------------------------------------
+    @app.get("/v1/audit-export")
+    def audit_export(
+        cursor: str | None = None, limit: int = DEFAULT_PAGE_SIZE,
+    ) -> dict[str, Any]:
+        if limit > MAX_PAGE_SIZE:
+            limit = MAX_PAGE_SIZE
+        return export_page(audit, cursor, limit).to_dict()
+
+    # -- decision forensics ------------------------------------------------
+    @app.get("/v1/forensics/{request_id}")
+    def forensics_export(request_id: str) -> Response:
+        return Response(
+            content=export_evidence(audit, request_id),
+            media_type="application/json",
+        )
+
+    @app.post("/v1/forensics/verify")
+    def forensics_verify(body: VerifyBody) -> dict[str, Any]:
+        blob = json.dumps(
+            body.evidence, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+        return verify_evidence(blob, audit).to_dict()
 
     return app
 
