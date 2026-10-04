@@ -29,7 +29,7 @@ def engine_env():
 
 @pytest.fixture(autouse=True)
 def decision_trace():
-    logger = logging.getLogger("privacy_gateway.decider")
+    logger = logging.getLogger("privacy_gateway")
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(logging.Formatter("[trace] %(message)s"))
     logger.addHandler(handler)

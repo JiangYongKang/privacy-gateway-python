@@ -80,3 +80,10 @@ class IdempotencyConflictError(PrivacyError):
 
     code = "IDEMPOTENCY_CONFLICT"
     http_status = 409
+
+
+class HoldNotFoundError(PrivacyError):
+    """No active retention hold exists for the given resource."""
+
+    code = "HOLD_NOT_FOUND"
+    http_status = 404

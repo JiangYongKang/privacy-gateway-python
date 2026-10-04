@@ -10,7 +10,7 @@ from __future__ import annotations
 from threading import RLock
 
 from .errors import PolicyNotFoundError
-from .models import Caller, Policy, Resource
+from .models import Caller, Policy, Resource, RetentionHold
 
 
 class LocalStore:
@@ -19,6 +19,7 @@ class LocalStore:
         self._resources: dict[str, Resource] = {}
         self._policies: dict[str, Policy] = {}
         self._current_policy_version: str | None = None
+        self._holds: dict[str, RetentionHold] = {}
         self._lock = RLock()
 
     # callers -------------------------------------------------------------
@@ -45,6 +46,47 @@ class LocalStore:
                 del self._resources[resource_id]
                 return True
             return False
+
+    # retention holds -------------------------------------------------------
+    def add_hold(self, hold: RetentionHold) -> None:
+        """Store a hold. Hold ids are unique; an existing id is a no-op only
+        when the stored hold is identical (idempotent retry)."""
+
+        with self._lock:
+            existing = self._holds.get(hold.hold_id)
+            if existing is not None:
+                if existing != hold:
+                    from .errors import IdempotencyConflictError
+
+                    raise IdempotencyConflictError(
+                        f"hold id {hold.hold_id!r} was already used with a "
+                        "different payload"
+                    )
+                return
+            self._holds[hold.hold_id] = hold
+
+    def get_hold(self, hold_id: str) -> RetentionHold | None:
+        with self._lock:
+            return self._holds.get(hold_id)
+
+    def update_hold(self, hold: RetentionHold) -> None:
+        """Replace a stored hold (used to record a release)."""
+
+        with self._lock:
+            self._holds[hold.hold_id] = hold
+
+    def active_hold_for(self, resource_id: str) -> RetentionHold | None:
+        """The currently active (unreleased) hold for a resource, if any."""
+
+        with self._lock:
+            for hold in self._holds.values():
+                if hold.resource_id == resource_id and hold.active:
+                    return hold
+            return None
+
+    def holds(self) -> list[RetentionHold]:
+        with self._lock:
+            return list(self._holds.values())
 
     # policies ------------------------------------------------------------
     def add_policy(self, policy: Policy) -> None:

@@ -18,7 +18,9 @@ from .audit import AuditLog
 from .clock import Clock, SystemClock
 from .decider import Decider
 from .errors import PrivacyError
+from .evidence import export_evidence, verify_evidence
 from .fixtures import build_seed_store
+from .holds import HoldService
 from .models import AccessRequest, Decision
 from .replay import replay_all
 from .store import LocalStore
@@ -30,6 +32,19 @@ class DecideBody(BaseModel):
     resource_id: str
     policy_version: str | None = None
     fields: list[str] | None = None
+
+
+class HoldBody(BaseModel):
+    hold_id: str
+    resource_id: str
+    operator_id: str
+    reason: str = ""
+
+
+class ReleaseBody(BaseModel):
+    release_id: str
+    resource_id: str
+    operator_id: str
 
 
 def _error_classes_by_code() -> dict[str, type[PrivacyError]]:
@@ -50,6 +65,7 @@ def create_app(
     audit = audit or AuditLog()
     clock = clock or SystemClock()
     engine = Decider(store, audit, clock)
+    holds = HoldService(store, audit, clock)
     error_registry = _error_classes_by_code()
 
     app = FastAPI(title="privacy-gateway", version="0.1.0")
@@ -94,6 +110,15 @@ def create_app(
     def list_audit() -> list[dict[str, Any]]:
         return [e.to_dict() for e in audit.entries()]
 
+    @app.get("/v1/audit/export")
+    def audit_export(after: int = 0, limit: int | None = None) -> dict[str, Any]:
+        page, next_cursor, has_more = audit.page(after, limit)
+        return {
+            "entries": [e.to_dict() for e in page],
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+        }
+
     @app.get("/v1/audit/{request_id}")
     def get_audit(request_id: str) -> dict[str, Any]:
         entry = audit.get_by_request(request_id)
@@ -108,6 +133,28 @@ def create_app(
     @app.get("/v1/replay")
     def replay() -> list[dict[str, Any]]:
         return replay_all(audit)
+
+    @app.post("/v1/holds")
+    def place_hold(body: HoldBody) -> dict[str, Any]:
+        result = holds.place_hold(
+            body.hold_id, body.resource_id, body.operator_id, body.reason,
+        )
+        return result.to_response()
+
+    @app.post("/v1/holds/release")
+    def release_hold(body: ReleaseBody) -> dict[str, Any]:
+        result = holds.release_hold(
+            body.release_id, body.resource_id, body.operator_id,
+        )
+        return result.to_response()
+
+    @app.get("/v1/evidence/{request_id}")
+    def evidence(request_id: str) -> dict[str, Any]:
+        return export_evidence(audit, request_id)
+
+    @app.post("/v1/evidence/verify")
+    def evidence_verify(document: dict[str, Any]) -> dict[str, Any]:
+        return verify_evidence(audit, document).to_dict()
 
     @app.get("/v1/policies")
     def list_policies() -> dict[str, Any]:

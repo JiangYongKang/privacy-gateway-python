@@ -31,6 +31,9 @@ class AuditLog:
         deny_code: str,
         request_fingerprint: str,
         decided_at: str,
+        *,
+        event_type: str = "access",
+        basis: str = "",
     ) -> AuditEntry:
         """Record ``result`` once per request_id; return the stored entry.
 
@@ -67,6 +70,10 @@ class AuditLog:
                 },
                 request_fingerprint=request_fingerprint,
                 decided_at=decided_at,
+                event_type=event_type,
+                basis=basis,
+                expired=result.expired,
+                hold_active=result.hold_active,
             )
             self._entries.append(entry)
             self._by_request[entry.request_id] = entry
@@ -81,3 +88,56 @@ class AuditLog:
 
         with self._lock:
             return list(self._entries)
+
+    # ------------------------------------------------------------------
+    # Incremental / batched export
+    # ------------------------------------------------------------------
+    MAX_PAGE_SIZE = 1000
+
+    def page(
+        self, after_sequence: int = 0, limit: int | None = None,
+    ) -> tuple[list[AuditEntry], int, bool]:
+        """One deterministic page of entries with ``sequence > after_sequence``.
+
+        Returns ``(entries, next_cursor, has_more)`` where ``next_cursor`` is
+        the sequence of the last entry in the page (or the input cursor when
+        the page is empty). Feeding ``next_cursor`` back in resumes exactly
+        where the previous page stopped; re-using the same cursor always
+        yields the same page, so retries cannot skip or duplicate entries.
+
+        The log is append-only with gap-free sequence numbers and the page is
+        computed from a single locked snapshot, so concurrent appends during
+        an export are simply picked up by later pages — never missed, never
+        duplicated, and order is always ascending sequence.
+        """
+
+        if after_sequence < 0:
+            after_sequence = 0
+        if limit is None:
+            limit = self.MAX_PAGE_SIZE
+        limit = max(1, min(limit, self.MAX_PAGE_SIZE))
+
+        with self._lock:
+            start = min(after_sequence, len(self._entries))
+            # sequence numbers are 1-based and gap-free, so the entry with
+            # sequence s lives at index s-1 in the append-only list.
+            page = self._entries[start:start + limit]
+            has_more = start + limit < len(self._entries)
+
+        next_cursor = page[-1].sequence if page else after_sequence
+        return page, next_cursor, has_more
+
+    def iter_pages(
+        self, after_sequence: int = 0, limit: int | None = None,
+    ):
+        """Generator over successive pages; streams without materialising the
+        whole history in the caller. Stops at the end of the log as observed
+        by the final (empty) page."""
+
+        cursor = after_sequence
+        while True:
+            page, cursor, has_more = self.page(cursor, limit)
+            if page:
+                yield page
+            if not has_more:
+                return

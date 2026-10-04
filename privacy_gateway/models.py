@@ -97,6 +97,35 @@ class Decision(str, Enum):
     ALLOW = "allow"
     DENY = "deny"
     TOMBSTONE = "tombstone"  # retention horizon passed: only a stub is emitted
+    RECORDED = "recorded"    # administrative event (retention hold / release)
+
+
+# ---------------------------------------------------------------------------
+# Retention holds (legal-hold style retention extension)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class RetentionHold:
+    """A retention extension attached to one resource.
+
+    While ``released_at`` is None the hold is *active*: the resource is
+    treated as not expired regardless of the plain retention horizon.
+    Releasing sets ``released_at`` and the plain horizon applies again
+    immediately. Holds are immutable once recorded; release produces a new
+    frozen value replacing the old one in the store.
+    """
+
+    hold_id: str                       # idempotency key of the place operation
+    resource_id: str
+    created_by: str                    # operator caller id
+    reason: str                        # safe, operator-supplied free text
+    created_at: str
+    released_at: str | None = None
+    released_by: str | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.released_at is None
 
 
 @dataclass(frozen=True)
@@ -129,7 +158,8 @@ class DecisionResult:
     fields: dict[str, FieldOutcome] = field(default_factory=dict)
     reason: str = ""                     # human-readable, safe text only
     decided_at: str = ""
-    expired: bool = False                # True when a retention tombstone
+    expired: bool = False                # past the plain retention horizon
+    hold_active: bool = False            # a retention hold was in effect
 
     def to_response(self) -> dict[str, Any]:
         return {
@@ -142,6 +172,7 @@ class DecisionResult:
             "reason": self.reason,
             "decided_at": self.decided_at,
             "expired": self.expired,
+            "hold_active": self.hold_active,
             "fields": {
                 name: {"action": fo.action.value, "value": fo.value}
                 for name, fo in sorted(self.fields.items())
@@ -169,6 +200,10 @@ class AuditEntry:
     fields_snapshot: dict[str, Any]
     request_fingerprint: str
     decided_at: str
+    event_type: str = "access"           # access | retention_hold | retention_release
+    basis: str = ""                      # distinguishable decision basis
+    expired: bool = False                # past plain retention horizon at decision time
+    hold_active: bool = False            # a retention hold was in effect
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -184,7 +219,18 @@ class AuditEntry:
             "fields_snapshot": self.fields_snapshot,
             "request_fingerprint": self.request_fingerprint,
             "decided_at": self.decided_at,
+            "event_type": self.event_type,
+            "basis": self.basis,
+            "expired": self.expired,
+            "hold_active": self.hold_active,
         }
+
+
+def fingerprint_payload(payload: dict[str, Any]) -> str:
+    """Deterministic SHA-256 fingerprint of a JSON-safe payload."""
+
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 def fingerprint_request(req: AccessRequest) -> str:
@@ -194,11 +240,9 @@ def fingerprint_request(req: AccessRequest) -> str:
     values are not part of a request, so no secret can enter the digest.
     """
 
-    payload = {
+    return fingerprint_payload({
         "caller_id": req.caller_id,
         "resource_id": req.resource_id,
         "policy_version": req.policy_version,
         "fields": list(req.fields) if req.fields is not None else None,
-    }
-    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+    })
